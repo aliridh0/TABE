@@ -26,9 +26,14 @@ connection_pool = pooling.MySQLConnectionPool(
 @contextmanager
 def get_conn():
     """A context manager to handle MySQL connection."""
-    conn = connection_pool.get_connection()
+    
+    # Inisialisasi conn ke None untuk keamanan jika get_connection() gagal
+    conn = None
     try:
+        conn = connection_pool.get_connection()
         yield conn
     finally:
+        # Kode Anda di sini sudah benar. 
+        # Untuk koneksi dari pool, .close() akan mengembalikannya ke pool.
         if conn:
-            conn.close()  # Make sure to close the connection after use
+            conn.close()

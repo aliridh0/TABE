@@ -111,7 +111,7 @@ def register_antenna():
             # if not result:
             #     return jsonify({"error": "Failed to generate new antenna ID."}), 500
             # next_id = result['nid']
-            ant_name = f"antenna-1"
+            ant_name = f"antenna-1" #ini harus diubah
 
             # Insert into antenna table
             cur.execute(insert_ant_sql, (ant_name, bw3dB, eff, F_D, direct_dB, id_sat))
@@ -136,8 +136,8 @@ def register_antenna():
                 "F_D": F_D,
                 "directivity_dB": direct_dB,
                 "id_satellite": id_sat,
-                "theta_deg": theta,
-                "pattern_dB": pattern
+                "theta_deg": theta.tolist(),
+                "pattern_dB": pattern.tolist()
             }
 
         return jsonify({"message": "Antenna data stored successfully!", "antenna": antenna_dict}), 201
