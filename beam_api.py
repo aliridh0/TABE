@@ -106,18 +106,82 @@ def fetch_gain_theta(ant_id):
 
 
 # ────────────────────  Endpoint: get-beams  ──────────────────────
-@beam_blueprint.route("/get-beams", methods=["GET"])
-def get_beams():
+# ────────────────── Endpoint: get-beams-with-contours (FIXED) ───────────────────
+@beam_blueprint.route("/get-beams-with-contours", methods=["GET"])
+def get_beams_with_contours():
+    """
+    Mengambil semua data beam, dan untuk setiap beam, menyertakan
+    data kontur yang sudah dikelompokkan.
+    """
     try:
-        with get_conn() as conn:  # Use the updated context manager for connection
+        with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
+
+            # === LANGKAH 1: Ambil semua data beam ===
             cur.execute("""
-              SELECT b.id, b.clat AS center_lat, b.clon AS center_lon,
-                     b.id_antena AS id_antena
+                SELECT b.id, b.clat AS center_lat, b.clon AS center_lon,
+                       b.id_antena AS id_antena
                 FROM beam AS b
+                ORDER BY b.id
             """)
             beams = cur.fetchall()
-            return jsonify(beams)
+
+            if not beams:
+                return jsonify([])
+
+            beam_map = {beam['id']: beam for beam in beams}
+            for beam in beam_map.values():
+                beam['contours'] = []
+
+            # === LANGKAH 2: Ambil semua data kontur yang relevan ===
+            beam_ids = tuple(beam_map.keys())
+
+            # --- PERBAIKAN DIMULAI DI SINI ---
+
+            # Buat placeholder (%s) sejumlah ID yang ada
+            # Contoh: jika ada 3 ID, ini akan menghasilkan "%s, %s, %s"
+            placeholders = ", ".join(["%s"] * len(beam_ids))
+
+            # Format query SQL dengan placeholder yang sudah dibuat
+            # Menggunakan f-string di sini aman karena isinya bukan dari input user
+            sql_query_contours = f"""
+                SELECT id_beam, level, lat, lon 
+                FROM countour 
+                WHERE id_beam IN ({placeholders}) 
+                ORDER BY id_beam, level, id
+            """
+
+            # Jalankan query dengan tuple ID secara langsung
+            cur.execute(sql_query_contours, beam_ids)
+            
+            # --- AKHIR PERBAIKAN ---
+
+            contours = cur.fetchall()
+
+            # === LANGKAH 3: Gabungkan (jahit) data kontur ke data beam ===
+            # (Tidak ada perubahan di sisa kode)
+            grouped_contours = {}
+            for point in contours:
+                beam_id = point['id_beam']
+                level = point['level']
+
+                if beam_id not in grouped_contours:
+                    grouped_contours[beam_id] = {}
+                if level not in grouped_contours[beam_id]:
+                    grouped_contours[beam_id][level] = []
+
+                grouped_contours[beam_id][level].append([point['lat'], point['lon']])
+
+            for beam_id, levels in grouped_contours.items():
+                formatted_levels = []
+                for level, points in sorted(levels.items()):
+                    formatted_levels.append({
+                        "level": level,
+                        "points": points
+                    })
+                beam_map[beam_id]['contours'] = formatted_levels
+
+            return jsonify(list(beam_map.values()))
 
     except Error as err:
         return jsonify({"error": f"Database error: {err}"}), 500

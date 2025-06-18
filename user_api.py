@@ -41,7 +41,7 @@ def register():
             new_user = cur.fetchone()
 
             # Generate JWT token for the newly registered akun
-            access_token = create_access_token(identity=new_user['id'])
+            access_token = create_access_token(identity=str(new_user['id']),expires_delta=False)
 
             return jsonify({"message": "User registered successfully!", "access_token": access_token}), 201
 
@@ -71,7 +71,7 @@ def login():
             if akun and bcrypt.checkpw(password.encode('utf-8'), akun['password'].encode('utf-8')):
 
                 # Create an access token using JWT (using string user_id)
-                access_token = create_access_token(identity=str(akun['id']))
+                access_token = create_access_token(identity=str(akun['id']),expires_delta=False)
                 return jsonify({"access_token": access_token}), 200
             else:
                 return jsonify({"error": "Invalid credentials"}), 401

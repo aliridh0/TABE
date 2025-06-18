@@ -1,9 +1,12 @@
 from flask import Flask, jsonify
 from flask_jwt_extended import JWTManager
+
+# Impor semua blueprint Anda, termasuk yang baru
 from user_api import user_blueprint 
 from satellite_api import satellite_blueprint
 from antenna_api import antenna_blueprint
 from beam_api import beam_blueprint
+from link_budget_api import link_budget_bp  # <-- 1. IMPOR BLUEPRINT BARU
 
 # Initialize the Flask application and JWT manager
 app = Flask(__name__)
@@ -18,12 +21,13 @@ jwt = JWTManager(app)
 app.register_blueprint(satellite_blueprint, url_prefix='/satellite')
 app.register_blueprint(antenna_blueprint, url_prefix='/antenna')
 app.register_blueprint(beam_blueprint, url_prefix='/beam')
-app.register_blueprint(user_blueprint, url_prefix='/user')  
+app.register_blueprint(user_blueprint, url_prefix='/user')
+app.register_blueprint(link_budget_bp, url_prefix='/link_budget') 
 
 # Root endpoint (optional)
 @app.route('/')
 def index():
-    return jsonify({"message": "Welcome to the API! Use /satellite, /antenna, /beam, or /user endpoints."})
+    return jsonify({"message": "Welcome! Available prefixes: /satellite, /antenna, /beam, /user, /link_budget"})
 
 # Run the application
 if __name__ == '__main__':

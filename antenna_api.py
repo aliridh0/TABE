@@ -1,17 +1,17 @@
-"""
-antenna_api.py – Flask API untuk menghitung & menyimpan data antena
-Gunakan pool koneksi MySQL dari db.py
-"""
-
 from flask import Blueprint, request, jsonify
-from koneksi import get_conn, Error         # ← koneksi pool
-import numpy as np, math, json
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from koneksi import get_conn, Error
+import numpy as np
+import math
 from scipy import special
+import json # Impor json untuk jaga-jaga, meski tidak dipakai di GET
 
-# ────────────────────────────────────────────────────────────────
-antenna_blueprint =  Blueprint('antenna', __name__)
+# --- Inisialisasi Blueprint ---
+antenna_blueprint = Blueprint('antenna', __name__)
 
-# ──────────────────────  Fungsi perhitungan  ────────────────────
+
+# --- Fungsi Perhitungan ---
+# (Tidak ada perubahan di sini)
 def calculate_directivity(freq_GHz, bw3dB_deg, eff=0.4364):
     c = 3e8
     bw_rad = math.radians(bw3dB_deg)
@@ -28,154 +28,125 @@ def radiation_pattern(freq_GHz, bw3dB_deg, F_D, theta_range=(0, 12), n=1000):
     D = bw3dB_deg * F_D
     a = D / 2
     wg_r = 0.002
-
     theta_deg = np.linspace(theta_range[0], theta_range[1], n)
     theta_rad = np.deg2rad(theta_deg)
-    
-    # Parameter untuk pola radiasi feed (TE11 mode)
     lambda_c_constant = 1.706 * wg_r 
     k_c = 2 * np.pi / lambda_c_constant
-    
     x_feed = k_c * wg_r * np.sin(theta_rad)
-    
-    # Perhitungan E_feed_val dengan penanganan pembagian nol (j1(x)/x -> 0.5 saat x->0)
     E_feed_val = np.zeros_like(x_feed, dtype=float)
     non_zero_mask_feed = x_feed != 0
     E_feed_val[non_zero_mask_feed] = special.j1(x_feed[non_zero_mask_feed]) / x_feed[non_zero_mask_feed]
     E_feed_val[~non_zero_mask_feed] = 0.5 
-    E_feed = E_feed_val / np.max(np.abs(E_feed_val)) # Normalisasi feed pattern
-
-    # Perhitungan pola radiasi parabola (aperture circular)
+    E_feed = E_feed_val / np.max(np.abs(E_feed_val))
     x_parab = k * a * np.sin(theta_rad)
     pattern_parab_val = np.zeros_like(x_parab, dtype=float)
     non_zero_mask_parab = x_parab != 0
     pattern_parab_val[non_zero_mask_parab] = (2 * special.j1(x_parab[non_zero_mask_parab]) / x_parab[non_zero_mask_parab])**2
     pattern_parab_val[~non_zero_mask_parab] = 1.0
-
     pattern_parab = pattern_parab_val
-    
-    # Pola total adalah perkalian pola feed dan pola parabola (dalam linier)
     pattern_total = (E_feed**2) * pattern_parab
-    pattern_total = pattern_total / np.max(pattern_total) # Normalisasi pola total
-    
-    # Konversi ke dB, menangani log10(0) dengan mengganti 0 dengan nilai sangat kecil
+    pattern_total = pattern_total / np.max(pattern_total)
     pattern_dB = 10 * np.log10(np.where(pattern_total > 1e-90, pattern_total, 1e-90))
-    pattern_dB[pattern_dB < -90] = -90 # Batasi nilai minimum untuk visualisasi
-
+    pattern_dB[pattern_dB < -90] = -90
     return theta_deg, pattern_dB
-    return theta, patt_dB
 
-# ──────────────────────  Endpoint: /calculate  ──────────────────
+
+# --- Endpoint POST (Membuat & Menyimpan Antena) ---
+# (Disarankan untuk tetap diamankan seperti ini)
 @antenna_blueprint.route("/calculate", methods=["POST"])
-def register_antenna():
-    data = request.get_json(silent=True)
+@jwt_required()
+def create_and_calculate_antenna():
+    id_akun_login = get_jwt_identity()
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON payload"}), 400
 
-    # ── Validasi input ───────────────────────────────────────────
     try:
         f_GHz = float(data["frequency"])
         bw3dB = float(data["bw3dB"])
         F_D   = float(data["F_D"])
         eff   = float(data.get("Effisiensi", 0.4364))
-        id_sat = data.get("id_satelite")        # opsional
+        id_sat = data.get("id_satelite")
+        ant_name_input = data.get("name", "Untitled Antenna")
     except (KeyError, ValueError) as e:
         return jsonify({"error": f"Invalid or missing field: {e}"}), 400
 
-    # ── Hitung parameter antena ─────────────────────────────────
-    direct_dB = calculate_directivity(f_GHz, bw3dB, eff)
-    theta, pattern = radiation_pattern(f_GHz, bw3dB, F_D)
-
-    # ── Simpan ke tabel antenna ─────────────────────────────────
-    insert_ant_sql = """
-      INSERT INTO antena
-        (name, bw3db_deg, eff, f_d, directivity, id_satelite)
-      VALUES (%s, %s, %s, %s, %s, %s)
-    """
-
-
-    # ── Simpan ke tabel antenna ─────────────────────────────────
-    insert_ant_sql = """
-      INSERT INTO antena
-        (name, bw3db_deg, eff, f_d, directivity, id_satelite)
-      VALUES (%s, %s, %s, %s, %s, %s)
-    """
-
     try:
-        # Use `with` statement to get the connection
         with get_conn() as conn:
-            cur = conn.cursor()
+            cur = conn.cursor(dictionary=True)
 
-            # cur.execute("SELECT IFNULL(MAX(id),0)+1 AS nid FROM antena")
-        
-            # # Ambil nilai dari dictionary hasil query
-            # result = cur.fetchone()
-            # if not result:
-            #     return jsonify({"error": "Failed to generate new antenna ID."}), 500
-            # next_id = result['nid']
-            ant_name = f"antenna-1" #ini harus diubah
+            if id_sat:
+                cur.execute("SELECT id FROM satelite WHERE id = %s AND id_akun = %s", (id_sat, id_akun_login))
+                if not cur.fetchone():
+                    return jsonify({"error": "Forbidden. You do not own this satellite."}), 403
+            
+            direct_dB = calculate_directivity(f_GHz, bw3dB, eff)
+            theta, pattern = radiation_pattern(f_GHz, bw3dB, F_D)
 
-            # Insert into antenna table
-            cur.execute(insert_ant_sql, (ant_name, bw3dB, eff, F_D, direct_dB, id_sat))
+            insert_ant_sql = "INSERT INTO antena (name, bw3db_deg, eff, f_d, directivity, id_satelite) VALUES (%s, %s, %s, %s, %s, %s)"
+            cur.execute(insert_ant_sql, (ant_name_input, bw3dB, eff, F_D, direct_dB, id_sat))
             ant_id = cur.lastrowid
 
-            # ── Bulk insert theta & pattern ─────────────────────
+            final_ant_name = f"sat{id_sat}_ant{ant_id}" if id_sat else f"ant{ant_id}"
+            cur.execute("UPDATE antena SET name = %s WHERE id = %s", (final_ant_name, ant_id))
+
             theta_rows = [(float(t), ant_id) for t in theta]
             pattern_rows = [(float(p), ant_id) for p in pattern]
-
             cur.executemany("INSERT INTO theta (deg, id_antena) VALUES (%s, %s)", theta_rows)
             cur.executemany("INSERT INTO pattern (deg, id_antena) VALUES (%s, %s)", pattern_rows)
 
             conn.commit()
 
-            # Return the saved data as a response
             antenna_dict = {
-                "id": ant_id,
-                "name": ant_name,
-                "frequency": f_GHz,
-                "bw3dB": bw3dB,
-                "efficiency": eff,
-                "F_D": F_D,
-                "directivity_dB": direct_dB,
-                "id_satellite": id_sat,
-                "theta_deg": theta.tolist(),
-                "pattern_dB": pattern.tolist()
+                "id": ant_id, "name": final_ant_name, "frequency": f_GHz, "bw3dB": bw3dB,
+                "efficiency": eff, "F_D": F_D, "directivity_dB": direct_dB, "id_satellite": id_sat,
+                "theta_deg": [float(t) for t in theta],
+                "pattern_dB": [float(p) for p in pattern]
             }
-
-        return jsonify({"message": "Antenna data stored successfully!", "antenna": antenna_dict}), 201
+            return jsonify({"message": "Antenna data stored successfully!", "antenna": antenna_dict}), 201
 
     except Error as err:
         return jsonify({"error": f"Database error: {err}"}), 500
-    
-# ──────────────────  Endpoint: /get-antenna-data  ───────────────
-@antenna_blueprint.route("/get-antenna-data", methods=["GET"])
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
+
+# --- Endpoint GET All (Versi Aman dengan Logika Query Asli Anda) ---
+@antenna_blueprint.route("/get-antennas", methods=["GET"])
+@jwt_required() # 1. Amankan endpoint
 def get_antennas():
+    id_akun_login = get_jwt_identity() # 2. Dapatkan identitas pengguna
+
     try:
-        # Using get_conn as a context manager
-        with get_conn() as conn:  # Connection is now managed by context manager
+        with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
 
-            # Get all antennas
-            cur.execute("""
-              SELECT id, name, bw3db_deg AS bw3dB, eff AS efficiency,
-                     f_d AS F_D, directivity, id_satelite
-                FROM antena
-            """)
+            # 3. Query pertama diubah untuk JOIN dan FILTER berdasarkan id_akun
+            # Ini akan mengambil daftar antena yang menjadi hak pengguna saja
+            sql_antennas = """
+                SELECT 
+                    ant.id, ant.name, ant.bw3db_deg, ant.eff, ant.f_d, 
+                    ant.directivity, ant.id_satelite
+                FROM antena AS ant
+                JOIN satelite AS s ON ant.id_satelite = s.id
+                WHERE s.id_akun = %s
+            """
+            cur.execute(sql_antennas, (id_akun_login,))
             antennas = cur.fetchall()
 
-            # For each antenna, get theta and pattern
+            # 4. Loop untuk mengambil theta dan pattern tetap dipertahankan sesuai permintaan Anda
             for ant in antennas:
                 ant_id = ant["id"]
 
-                cur.execute("SELECT deg FROM theta WHERE id_antena=%s", (ant_id,))
+                cur.execute("SELECT deg FROM theta WHERE id_antena=%s ORDER BY id", (ant_id,))
                 ant["theta_deg"] = [row["deg"] for row in cur.fetchall()]
 
-                cur.execute("SELECT deg FROM pattern WHERE id_antena=%s",
-                            (ant_id,))
+                cur.execute("SELECT deg FROM pattern WHERE id_antena=%s ORDER BY id", (ant_id,))
                 ant["pattern_dB"] = [row["deg"] for row in cur.fetchall()]
 
-        # Return the fetched data
-        return jsonify(antennas)
+            # 5. Blok 'json.loads' dihapus karena tidak lagi diperlukan dan menyebabkan error.
+
+            return jsonify(antennas)
 
     except Error as err:
         return jsonify({"error": f"Database error: {err}"}), 500
-
-
