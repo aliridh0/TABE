@@ -1,129 +1,108 @@
 from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
 from koneksi import get_conn, Error
-import numpy as np, math, json
+import numpy as np
+import math
 from scipy.interpolate import interp1d
 
+# --- Inisialisasi Blueprint ---
 beam_blueprint = Blueprint('beam', __name__)
 
-# ─────────────────────────  Util Geometri  ───────────────────────
-def generate_spot_beam_properties(clat, clon, gain_dB, theta_deg,
-                                  sat_lon, sat_lat):
-    """Hitung major/minor axis, rotasi, dan half-beam-width (°) –1/–2/–3 dB."""
+
+# --- Fungsi Perhitungan Geometri ---
+def generate_spot_beam_properties(clat, clon, gain_dB, theta_deg, sat_lon, sat_lat):
     dlon = np.radians(clon - sat_lon)
     ang  = np.arccos(np.sin(np.radians(clat)) * np.sin(np.radians(sat_lat)) +
                      np.cos(np.radians(clat)) * np.cos(np.radians(sat_lat)) * np.cos(dlon))
     ang  = np.clip(ang, 0, np.radians(85.0))
-
-    # minor-axis default 0.25° (boleh disesuaikan)
     minor_axis = 0.25
-
-    # Interpolasi sudut pada –3 dB
     f_interp = interp1d(gain_dB, theta_deg, fill_value="extrapolate")
-    th3  = float(f_interp(-3))
-    vis3 = 3.334             # constant scaling (lihat rumus Anda)
-    ratio1 = float(f_interp(-1) / th3)
-    ratio2 = float(f_interp(-2) / th3)
-
-    half_bw = {
-        -3: vis3,
-        -2: vis3 * ratio2,
-        -1: vis3 * ratio1,
-    }
-
+    th3 = float(f_interp(-3))
+    vis3 = 3.334
+    ratio1 = float(f_interp(-1) / th3) if th3 != 0 else 1
+    ratio2 = float(f_interp(-2) / th3) if th3 != 0 else 1
+    half_bw = {-3: vis3, -2: vis3 * ratio2, -1: vis3 * ratio1}
     distortion = 1 / np.cos(ang)
     major_axis = minor_axis * distortion
-
-    # orientasi ellipse
-    y  = np.sin(np.radians(clon - sat_lon)) * np.cos(np.radians(clat))
-    x  = (np.cos(np.radians(sat_lat)) * np.sin(np.radians(clat))
-          - np.sin(np.radians(sat_lat)) * np.cos(np.radians(clat))
-          * np.cos(np.radians(clon - sat_lon)))
+    y = np.sin(np.radians(clon - sat_lon)) * np.cos(np.radians(clat))
+    x = (np.cos(np.radians(sat_lat)) * np.sin(np.radians(clat))
+         - np.sin(np.radians(sat_lat)) * np.cos(np.radians(clat))
+         * np.cos(np.radians(clon - sat_lon)))
     az = np.degrees(np.arctan2(y, x))
     rot = (90 - az + 360) % 360
     return major_axis, minor_axis, rot, half_bw
 
 def ellipse_points(clat, clon, major, minor, rot, num=100):
-    """Hasilkan array [[lat,lon], …] titik ellipse."""
-    t   = np.linspace(0, 2*np.pi, num)
+    t  = np.linspace(0, 2*np.pi, num)
     rot = np.deg2rad(rot)
-    x   = (major/2) * np.cos(t)
-    y   = (minor/2) * np.sin(t)
-    xr  = x*np.cos(rot) - y*np.sin(rot)
-    yr  = x*np.sin(rot) + y*np.cos(rot)
+    x  = (major/2) * np.cos(t)
+    y  = (minor/2) * np.sin(t)
+    xr = x*np.cos(rot) - y*np.sin(rot)
+    yr = x*np.sin(rot) + y*np.cos(rot)
     return [[clat + yr[i], clon + xr[i]] for i in range(num)]
 
-# ───────────────────────  Helper Query  ──────────────────────────
-# Di dalam file beam_api.py
 
-def fetch_satellite(sat_id):
-    # Gunakan 'with' pada koneksi, bukan pada cursor
+# --- Fungsi Helper Query (Diperbarui) ---
+
+def validate_antenna_and_get_satellite(id_antena, id_akun):
+    """
+    Fungsi ini melakukan dua hal:
+    1. Memvalidasi bahwa id_antena yang diberikan adalah milik id_akun yang login.
+    2. Jika valid, mengembalikan data satelit yang terhubung ke antena tersebut.
+    """
     try:
         with get_conn() as conn:
-            cur = conn.cursor(dictionary=True) # Buat cursor seperti biasa
-
-            # Jika sat_id tidak diberikan, ambil satelit pertama
-            if sat_id is None:
-                cur.execute("SELECT * FROM satelite ORDER BY id LIMIT 1")
-            else:
-                cur.execute("SELECT * FROM satelite WHERE id = %s", (sat_id,))
-            
-            satellite = cur.fetchone()
-            
-            cur.close() # Tutup cursor setelah selesai
-            return satellite
-
-    except Error as err:
-        # Menangani error database jika terjadi
-        print(f"Database error in fetch_satellite: {err}")
+            cur = conn.cursor(dictionary=True)
+            sql = """
+                SELECT s.lat, s.lon, s.alt
+                FROM antena AS a
+                JOIN satelite AS s ON a.id_satelite = s.id
+                WHERE a.id = %s AND s.id_akun = %s
+            """
+            cur.execute(sql, (id_antena, id_akun))
+            satellite_data = cur.fetchone()
+            cur.close()
+            return satellite_data # Akan None jika tidak valid atau tidak ditemukan
+    except Error as e:
+        print(f"Database error in validate_antenna_and_get_satellite: {e}")
         return None
-
-# Di dalam file yang sama
 
 def fetch_gain_theta(ant_id):
     try:
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
-            
             cur.execute("SELECT deg FROM theta WHERE id_antena = %s ORDER BY id", (ant_id,))
             theta_deg = [row["deg"] for row in cur.fetchall()]
-
-            # Get the pattern values from the 'pattern' table for the given ant_id
             cur.execute("SELECT deg FROM pattern WHERE id_antena = %s ORDER BY id", (ant_id,))
             pattern_dB = [row["deg"] for row in cur.fetchall()]
-            
             cur.close()
-
             if theta_deg and pattern_dB:
                 return pattern_dB, theta_deg
             else:
-                # Handle kasus jika antena tidak ditemukan
-                raise ValueError(f"Antenna with id {ant_id} not found.")
-
-    except Error as err:
-        print(f"Database error in fetch_gain_theta: {err}")
-        # Melempar exception agar bisa ditangkap oleh endpoint
-        raise Exception(f"Database error while fetching antenna {ant_id}")
+                raise ValueError(f"Gain/theta data not found for antenna id {ant_id}")
+    except Error as e:
+        raise Exception(f"Database error while fetching gain/theta: {e}")
 
 
-# ────────────────────  Endpoint: get-beams  ──────────────────────
-# ────────────────── Endpoint: get-beams-with-contours (FIXED) ───────────────────
+# --- Endpoint GET All Beams (Versi Aman) ---
 @beam_blueprint.route("/get-beams-with-contours", methods=["GET"])
+@jwt_required()
 def get_beams_with_contours():
-    """
-    Mengambil semua data beam, dan untuk setiap beam, menyertakan
-    data kontur yang sudah dikelompokkan.
-    """
+    id_akun_login = get_jwt_identity()
     try:
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
 
-            # === LANGKAH 1: Ambil semua data beam ===
-            cur.execute("""
-                SELECT b.id, b.clat AS center_lat, b.clon AS center_lon,
-                       b.id_antena AS id_antena
+            # Query awal diubah untuk JOIN dan FILTER berdasarkan id_akun
+            sql_beams = """
+                SELECT b.id, b.clat AS center_lat, b.clon AS center_lon, b.id_antena
                 FROM beam AS b
+                JOIN antena AS a ON b.id_antena = a.id
+                JOIN satelite AS s ON a.id_satelite = s.id
+                WHERE s.id_akun = %s
                 ORDER BY b.id
-            """)
+            """
+            cur.execute(sql_beams, (id_akun_login,))
             beams = cur.fetchall()
 
             if not beams:
@@ -133,77 +112,59 @@ def get_beams_with_contours():
             for beam in beam_map.values():
                 beam['contours'] = []
 
-            # === LANGKAH 2: Ambil semua data kontur yang relevan ===
             beam_ids = tuple(beam_map.keys())
+            if not beam_ids: # Jika tidak ada beam, kembalikan list kosong
+                return jsonify([])
 
-            # --- PERBAIKAN DIMULAI DI SINI ---
-
-            # Buat placeholder (%s) sejumlah ID yang ada
-            # Contoh: jika ada 3 ID, ini akan menghasilkan "%s, %s, %s"
             placeholders = ", ".join(["%s"] * len(beam_ids))
-
-            # Format query SQL dengan placeholder yang sudah dibuat
-            # Menggunakan f-string di sini aman karena isinya bukan dari input user
-            sql_query_contours = f"""
-                SELECT id_beam, level, lat, lon 
-                FROM countour 
-                WHERE id_beam IN ({placeholders}) 
-                ORDER BY id_beam, level, id
-            """
-
-            # Jalankan query dengan tuple ID secara langsung
+            sql_query_contours = f"SELECT id_beam, level, lat, lon FROM countour WHERE id_beam IN ({placeholders}) ORDER BY id_beam, level, id"
             cur.execute(sql_query_contours, beam_ids)
-            
-            # --- AKHIR PERBAIKAN ---
-
             contours = cur.fetchall()
-
-            # === LANGKAH 3: Gabungkan (jahit) data kontur ke data beam ===
-            # (Tidak ada perubahan di sisa kode)
+            
+            # Proses stitching data (tidak ada perubahan)
             grouped_contours = {}
             for point in contours:
                 beam_id = point['id_beam']
                 level = point['level']
-
-                if beam_id not in grouped_contours:
-                    grouped_contours[beam_id] = {}
-                if level not in grouped_contours[beam_id]:
-                    grouped_contours[beam_id][level] = []
-
+                if beam_id not in grouped_contours: grouped_contours[beam_id] = {}
+                if level not in grouped_contours[beam_id]: grouped_contours[beam_id][level] = []
                 grouped_contours[beam_id][level].append([point['lat'], point['lon']])
 
             for beam_id, levels in grouped_contours.items():
                 formatted_levels = []
                 for level, points in sorted(levels.items()):
-                    formatted_levels.append({
-                        "level": level,
-                        "points": points
-                    })
-                beam_map[beam_id]['contours'] = formatted_levels
+                    formatted_levels.append({"level": level, "points": points})
+                if beam_id in beam_map:
+                    beam_map[beam_id]['contours'] = formatted_levels
 
             return jsonify(list(beam_map.values()))
-
     except Error as err:
         return jsonify({"error": f"Database error: {err}"}), 500
 
+
+# --- Endpoint POST (Membuat & Menyimpan Beam, Versi Aman) ---
 @beam_blueprint.route("/store-beam", methods=["POST"])
+@jwt_required()
 def store_beam():
-    data = request.get_json(silent=True)
+    id_akun_login = get_jwt_identity()
+    data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
 
     try:
-        # 1. Ekstraksi & Validasi Data
         clat = float(data["center_lat"])
         clon = float(data["center_lon"])
         ant_id = int(data["id_antena"])
-        sat_id = data.get("id_satelit")
-
-        # 2. Logika Bisnis & Kalkulasi
-        sat = fetch_satellite(sat_id)
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"error": f"Invalid or missing field: {e}"}), 400
+    
+    try:
+        # 1. Validasi Kepemilikan Antena dan ambil data satelit terkait
+        sat = validate_antenna_and_get_satellite(ant_id, id_akun_login)
         if not sat:
-            return jsonify({"error": "Satellite not found"}), 404 # Gunakan 404 untuk Not Found
+            return jsonify({"error": "Forbidden. You do not own the antenna for this beam."}), 403
 
+        # 2. Lanjutkan kalkulasi
         gain_dB, theta_deg = fetch_gain_theta(ant_id)
         maj, minr, rot, hbw = generate_spot_beam_properties(
             clat, clon, gain_dB, theta_deg, sat["lon"], sat["lat"]
@@ -211,65 +172,37 @@ def store_beam():
 
         levels = []
         for level_val in (-1, -2, -3):
+            # Asumsi: half_bw tidak digunakan di sini, jadi kita abaikan
             points = ellipse_points(clat, clon, maj, minr, rot)
-            levels.append({
-                "level": level_val,
-                "points": points
-            })
+            levels.append({"level": level_val, "points": points})
             
-    except (KeyError, ValueError) as e:
-        return jsonify({"error": f"Invalid or missing field: {e}"}), 400
-    except Exception as e:
-        # Menangkap error lain dari fungsi helper
-        return jsonify({"error": f"An error occurred during calculation: {e}"}), 500
-
-    try:
-        # 3. Interaksi Database dalam satu transaksi
+        # 3. Simpan ke Database
         with get_conn() as conn:
             cur = conn.cursor()
-
-            # --- MULAI TRANSAKSI ---
-
-            # Insert ke tabel 'beam'
             cur.execute(
                 "INSERT INTO beam (clat, clon, id_antena) VALUES (%s, %s, %s)",
                 (clat, clon, ant_id)
             )
-
-            # Dapatkan ID dari baris yang baru saja dimasukkan
             beam_id = cur.lastrowid
             if not beam_id:
-                 # Jika lastrowid tidak didukung atau gagal, handle error
-                 conn.rollback() # Batalkan insert sebelumnya
-                 return jsonify({"error": "Failed to get beam ID after insertion."}), 500
+                conn.rollback()
+                return jsonify({"error": "Failed to get beam ID after insertion."}), 500
 
-
-            # Insert ke tabel 'countour'
             for level in levels:
                 level_data = [
-                    (level["level"], float(point[0]), float(point[1]), beam_id) 
+                    (level["level"], float(point[0]), float(point[1]), beam_id)
                     for point in level["points"]
                 ]
-                if level_data: # Pastikan data tidak kosong
+                if level_data:
                     cur.executemany(
-                        "INSERT INTO countour (level, lat, lon, id_beam) VALUES (%s, %s, %s, %s)", 
+                        "INSERT INTO countour (level, lat, lon, id_beam) VALUES (%s, %s, %s, %s)",
                         level_data
                     )
-
-            # Lakukan commit HANYA SEKALI di akhir setelah semua operasi berhasil
             conn.commit()
 
-            # --- AKHIR TRANSAKSI ---
-
-        # Jika semua berhasil, kembalikan respons sukses
-        return jsonify({
-            "message": "Beam and levels stored successfully!",
-            "beam_id": beam_id
-        }), 201
+        return jsonify({"message": "Beam and levels stored successfully!", "beam_id": beam_id}), 201
 
     except Error as err:
-        # Jika ada error database, koneksi akan di-rollback secara implisit saat 'with' block exit
-        # (tergantung implementasi get_conn) atau bisa ditambahkan conn.rollback() secara eksplisit
         return jsonify({"error": f"Database error: {err}"}), 500
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500

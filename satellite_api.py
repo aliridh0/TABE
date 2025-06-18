@@ -1,17 +1,17 @@
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity  # Import JWT helpers
-from koneksi import get_conn, Error  # pool koneksi dari db.py
+from flask_jwt_extended import jwt_required, get_jwt_identity  # Pastikan sudah di-import
+from koneksi import get_conn, Error
 
 satellite_blueprint = Blueprint('satellite', __name__)
 
 # ------------------------------------------------------------------
-# Endpoint: simpan data satelit
+# Endpoint: simpan data satelit (SUDAH BENAR DAN AMAN)
 # ------------------------------------------------------------------
 @satellite_blueprint.route("/store-satellite", methods=["POST"])
-@jwt_required()  # Ensure the user is authenticated with JWT
+@jwt_required()
 def store_satellite():
-    # Get the user_id from the JWT token
-    user_id = get_jwt_identity()  # This will return the user_id as a string
+    # Get the user_id (id_akun) from the JWT token
+    id_akun_login = get_jwt_identity()
 
     data = request.get_json()
 
@@ -28,24 +28,35 @@ def store_satellite():
     try:
         with get_conn() as conn:
             cur = conn.cursor()
-            # Insert satellite data along with the user_id (from JWT token)
+            # Insert satellite data along with the id_akun from JWT
             query = "INSERT INTO satelite (lat, lon, alt, id_akun) VALUES (%s, %s, %s, %s)"
-            cur.execute(query, (lat, lon, alt, user_id))  # Pass user_id from JWT token
+            cur.execute(query, (lat, lon, alt, id_akun_login))
             conn.commit()
             return jsonify({"message": "Satellite stored successfully!"}), 201
     except Error as err:
         return jsonify({"error": f"Database error: {err}"}), 500
 
 # ------------------------------------------------------------------
-# Endpoint: ambil semua data satelit
+# Endpoint: ambil data satelit (VERSI BARU YANG AMAN)
 # ------------------------------------------------------------------
 @satellite_blueprint.route("/get-satellites", methods=["GET"])
+@jwt_required()  # 1. Amankan endpoint dengan decorator JWT
 def get_satellites():
+    # 2. Ambil identitas pengguna (id_akun) dari token
+    id_akun_login = get_jwt_identity()
+
     try:
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT id, lat, lon FROM satelite")
+            
+            # 3. Ubah query untuk memfilter berdasarkan id_akun
+            query = "SELECT id, lat, lon, alt, id_akun FROM satelite WHERE id_akun = %s"
+            
+            # 4. Kirim id_akun sebagai parameter ke query
+            cur.execute(query, (id_akun_login,))
+            
             sats = cur.fetchall()
             return jsonify({"satellites": sats})
+            
     except Error as err:
         return jsonify({"error": f"Database error: {err}"}), 500
