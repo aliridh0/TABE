@@ -4,11 +4,10 @@ from koneksi import get_conn, Error
 import numpy as np
 import math
 from scipy import special
-import json # Impor json untuk jaga-jaga, meski tidak dipakai di GET
+import json
 
 # --- Inisialisasi Blueprint ---
 antenna_blueprint = Blueprint('antenna', __name__)
-
 
 # --- Fungsi Perhitungan ---
 # (Tidak ada perubahan di sini)
@@ -52,7 +51,6 @@ def radiation_pattern(freq_GHz, bw3dB_deg, F_D, theta_range=(0, 12), n=1000):
 
 
 # --- Endpoint POST (Membuat & Menyimpan Antena) ---
-# (Disarankan untuk tetap diamankan seperti ini)
 @antenna_blueprint.route("/calculate", methods=["POST"])
 @jwt_required()
 def create_and_calculate_antenna():
@@ -83,8 +81,10 @@ def create_and_calculate_antenna():
             direct_dB = calculate_directivity(f_GHz, bw3dB, eff)
             theta, pattern = radiation_pattern(f_GHz, bw3dB, F_D)
 
-            insert_ant_sql = "INSERT INTO antena (name, bw3db_deg, eff, f_d, directivity, id_satelite) VALUES (%s, %s, %s, %s, %s, %s)"
-            cur.execute(insert_ant_sql, (ant_name_input, bw3dB, eff, F_D, direct_dB, id_sat))
+            # --- PERUBAHAN DI SINI: Tambahkan frekuensi ke dalam query INSERT ---
+            insert_ant_sql = "INSERT INTO antena (name, frekuensi, bw3db_deg, eff, f_d, directivity, id_satelite) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            # --- PERUBAHAN DI SINI: Tambahkan f_GHz ke dalam tuple values ---
+            cur.execute(insert_ant_sql, (ant_name_input, f_GHz, bw3dB, eff, F_D, direct_dB, id_sat))
             ant_id = cur.lastrowid
 
             final_ant_name = f"sat{id_sat}_ant{ant_id}" if id_sat else f"ant{ant_id}"
@@ -98,7 +98,7 @@ def create_and_calculate_antenna():
             conn.commit()
 
             antenna_dict = {
-                "id": ant_id, "name": final_ant_name, "frequency": f_GHz, "bw3dB": bw3dB,
+                "id": ant_id, "name": final_ant_name, "frequency_GHz": f_GHz, "bw3dB": bw3dB, # <-- Ditambahkan di respons
                 "efficiency": eff, "F_D": F_D, "directivity_dB": direct_dB, "id_satellite": id_sat,
                 "theta_deg": [float(t) for t in theta],
                 "pattern_dB": [float(p) for p in pattern]
@@ -113,19 +113,18 @@ def create_and_calculate_antenna():
 
 # --- Endpoint GET All (Versi Aman dengan Logika Query Asli Anda) ---
 @antenna_blueprint.route("/get-antennas", methods=["GET"])
-@jwt_required() # 1. Amankan endpoint
+@jwt_required()
 def get_antennas():
-    id_akun_login = get_jwt_identity() # 2. Dapatkan identitas pengguna
+    id_akun_login = get_jwt_identity()
 
     try:
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
 
-            # 3. Query pertama diubah untuk JOIN dan FILTER berdasarkan id_akun
-            # Ini akan mengambil daftar antena yang menjadi hak pengguna saja
+            # --- PERUBAHAN DI SINI: Tambahkan kolom frekuensi ke dalam SELECT ---
             sql_antennas = """
                 SELECT 
-                    ant.id, ant.name, ant.bw3db_deg, ant.eff, ant.f_d, 
+                    ant.id, ant.name, ant.frekuensi, ant.bw3db_deg, ant.eff, ant.f_d, 
                     ant.directivity, ant.id_satelite
                 FROM antena AS ant
                 JOIN satelite AS s ON ant.id_satelite = s.id
@@ -134,7 +133,6 @@ def get_antennas():
             cur.execute(sql_antennas, (id_akun_login,))
             antennas = cur.fetchall()
 
-            # 4. Loop untuk mengambil theta dan pattern tetap dipertahankan sesuai permintaan Anda
             for ant in antennas:
                 ant_id = ant["id"]
 
@@ -143,8 +141,6 @@ def get_antennas():
 
                 cur.execute("SELECT deg FROM pattern WHERE id_antena=%s ORDER BY id", (ant_id,))
                 ant["pattern_dB"] = [row["deg"] for row in cur.fetchall()]
-
-            # 5. Blok 'json.loads' dihapus karena tidak lagi diperlukan dan menyebabkan error.
 
             return jsonify(antennas)
 
