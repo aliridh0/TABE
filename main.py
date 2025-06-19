@@ -1,4 +1,5 @@
 from flask import Flask, jsonify
+from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 
 # Impor semua blueprint Anda, termasuk yang baru
@@ -16,6 +17,8 @@ app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'  # Replace with your actual
 
 # Initialize the JWT manager
 jwt = JWTManager(app)
+
+CORS(app, origins="http://localhost:3000")
 
 # Register Blueprints
 app.register_blueprint(satellite_blueprint, url_prefix='/satellite')
