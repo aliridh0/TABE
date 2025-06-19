@@ -350,34 +350,30 @@ def update_link(link_id):
         # Rollback otomatis terjadi jika 'with get_conn()' gagal atau ada exception
         return jsonify({"error": f"Database error: {e}"}), 500
     
-# --- Endpoint GET & GET All ---
-@link_budget_bp.route("/link/<int:link_id>", methods=["GET"])
-@jwt_required()
-def get_link_data(link_id):
-    id_akun_login = get_jwt_identity()
-    try:
-        with get_conn() as conn:
-            cur = conn.cursor(dictionary=True)
-            sql = "SELECT l.*, b.clat, b.clon, d.* FROM link AS l JOIN beam AS b ON l.id_beam = b.id JOIN default_link as d ON l.id_default = d.id JOIN antena AS a ON b.id_antena = a.id JOIN satelite AS s ON a.id_satelite = s.id WHERE s.id_akun = %s AND l.id = %s"
-            cur.execute(sql, (id_akun_login, link_id))
-            link_data = cur.fetchone()
-            cur.close()
-            if link_data:
-                return jsonify(link_data)
-            else:
-                return jsonify({"error": "No stored link data found for this ID, or you do not have permission to view it."}), 404
-    except Error as e:
-        return jsonify({"error": f"Database error: {e}"}), 500
-
+# --- Endpoint GET All ---
 @link_budget_bp.route("/links", methods=["GET"])
 @jwt_required()
 def get_all_links():
-    id_akun_login = get_jwt_identity()
+    id_akun_login = get_jwt_identity() 
     try:
-        with get_conn() as conn:
-            cur = conn.cursor(dictionary=True)
-            sql = "SELECT l.id, l.id_beam, b.clat, b.clon, l.distance, l.directivity, l.cinr, l.evaluasi, l.ci, l.cn, l.gt, l.eirp, l.fsl, l.id_default FROM link AS l JOIN beam AS b ON l.id_beam = b.id JOIN antena AS a ON b.id_antena = a.id JOIN satelite AS s ON a.id_satelite = s.id WHERE s.id_akun = %s ORDER BY l.id DESC"
-            cur.execute(sql, (id_akun_login,))
+        with get_conn() as conn: 
+            cur = conn.cursor(dictionary=True) 
+            # SQL query dimodifikasi untuk JOIN dengan tabel default_link
+            sql = """
+                SELECT 
+                    l.id, l.id_beam, b.clat, b.clon, l.distance, l.directivity, 
+                    l.cinr, l.evaluasi, l.ci, l.cn, l.gt, l.eirp, l.fsl, 
+                    l.id_default,
+                    d.dir_ground, d.tx_sat, d.suhu, d.bw, d.loss, d.ci_down
+                FROM link AS l 
+                JOIN beam AS b ON l.id_beam = b.id 
+                JOIN antena AS a ON b.id_antena = a.id 
+                JOIN satelite AS s ON a.id_satelite = s.id 
+                JOIN default_link AS d ON l.id_default = d.id -- Menambahkan JOIN ke tabel default_link
+                WHERE s.id_akun = %s 
+                ORDER BY l.id DESC
+            """
+            cur.execute(sql, (id_akun_login,)) 
             all_link_data = cur.fetchall()
             cur.close()
             return jsonify(all_link_data)
