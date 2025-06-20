@@ -206,3 +206,57 @@ def store_beam():
         return jsonify({"error": f"Database error: {err}"}), 500
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
+# --- Endpoint DELETE (Menghapus Beam dan Contours Terkait) ---
+@beam_blueprint.route("/delete-beam/<int:beam_id>", methods=["DELETE"])
+@jwt_required()
+def delete_beam(beam_id):
+    """
+    Menghapus sebuah beam spesifik beserta semua data contour yang terkait dengannya.
+    Hanya pemilik sah (berdasarkan token JWT) yang dapat menghapus beam.
+    """
+    # 1. Dapatkan identitas pengguna dari token JWT
+    id_akun_login = get_jwt_identity()
+
+    try:
+        with get_conn() as conn:
+            # Gunakan kursor untuk operasi database
+            cur = conn.cursor()
+
+            # 2. Validasi Kepemilikan Beam (Langkah Keamanan Krusial)
+            # Query ini memeriksa apakah beam_id yang diberikan benar-benar milik id_akun yang login
+            auth_query = """
+                SELECT b.id 
+                FROM beam AS b
+                JOIN antena AS a ON b.id_antena = a.id
+                JOIN satelite AS s ON a.id_satelite = s.id
+                WHERE b.id = %s AND s.id_akun = %s
+            """
+            cur.execute(auth_query, (beam_id, id_akun_login))
+            
+            # Jika query tidak mengembalikan hasil, berarti beam tidak ada atau bukan milik user
+            if cur.fetchone() is None:
+                return jsonify({"error": "Beam not found or you do not have permission to delete it."}), 404
+
+            # 3. Lakukan Penghapusan dalam satu transaksi
+            # PENTING: Hapus data di tabel 'countour' terlebih dahulu karena memiliki foreign key ke 'beam'
+            
+            # Hapus semua baris contour yang terkait dengan beam_id
+            cur.execute("DELETE FROM countour WHERE id_beam = %s", (beam_id,))
+            num_contours_deleted = cur.rowcount # Opsional: untuk logging atau respons
+
+            # Setelah data contour terkait bersih, hapus data beam utama
+            cur.execute("DELETE FROM beam WHERE id = %s", (beam_id,))
+            
+            # Commit transaksi untuk menyimpan semua perubahan
+            conn.commit()
+
+            return jsonify({
+                "message": f"Beam ID {beam_id} and its {num_contours_deleted} contour points have been deleted successfully."
+            }), 200
+
+    except Error as err:
+        # Jika terjadi error, 'with get_conn()' akan otomatis me-rollback transaksi
+        return jsonify({"error": f"Database error during deletion: {err}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
