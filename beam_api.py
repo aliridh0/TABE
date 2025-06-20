@@ -9,28 +9,40 @@ from scipy.interpolate import interp1d
 beam_blueprint = Blueprint('beam', __name__)
 
 
-# --- Fungsi Perhitungan Geometri ---
-def generate_spot_beam_properties(clat, clon, gain_dB, theta_deg, sat_lon, sat_lat):
+# --- Fungsi Perhitungan Geometri (VERSI BARU) ---
+def generate_spot_beam_properties(clat, clon, beam_radius_deg, sat_lon, sat_lat):
+    """
+    Menghitung properti elips (major, minor, rotasi) berdasarkan 
+    radius angular beam yang spesifik untuk satu level kontur.
+    """
+    # Menghitung jarak angular dari SSP (sub-satellite point) ke pusat beam
     dlon = np.radians(clon - sat_lon)
-    ang  = np.arccos(np.sin(np.radians(clat)) * np.sin(np.radians(sat_lat)) +
-                     np.cos(np.radians(clat)) * np.cos(np.radians(sat_lat)) * np.cos(dlon))
-    ang  = np.clip(ang, 0, np.radians(85.0))
-    minor_axis = 0.25
-    f_interp = interp1d(gain_dB, theta_deg, fill_value="extrapolate")
-    th3 = float(f_interp(-3))
-    vis3 = 3.334
-    ratio1 = float(f_interp(-1) / th3) if th3 != 0 else 1
-    ratio2 = float(f_interp(-2) / th3) if th3 != 0 else 1
-    half_bw = {-3: vis3, -2: vis3 * ratio2, -1: vis3 * ratio1}
-    distortion = 1 / np.cos(ang)
+    # Satelit GEO berada di lintang 0
+    ang = np.arccos(np.sin(np.radians(clat)) * np.sin(np.radians(sat_lat)) +
+                    np.cos(np.radians(clat)) * np.cos(np.radians(sat_lat)) * np.cos(dlon))
+    
+    # Batasi sudut untuk menghindari masalah numerik
+    ang = np.clip(ang, 0, np.radians(85.0))
+
+    # Minor axis (sumbu minor) sekarang didasarkan pada radius beam input
+    minor_axis = beam_radius_deg
+
+    # Faktor distorsi karena kelengkungan bumi
+    distortion = 1.0 / np.cos(ang) if np.cos(ang) > 1e-9 else 1.0 / 1e-9
     major_axis = minor_axis * distortion
+
+    # Menghitung sudut rotasi (azimuth) dari satelit ke pusat beam
     y = np.sin(np.radians(clon - sat_lon)) * np.cos(np.radians(clat))
     x = (np.cos(np.radians(sat_lat)) * np.sin(np.radians(clat))
          - np.sin(np.radians(sat_lat)) * np.cos(np.radians(clat))
          * np.cos(np.radians(clon - sat_lon)))
+    
     az = np.degrees(np.arctan2(y, x))
+    
+    # Konversi azimuth ke sudut rotasi untuk elips
     rot = (90 - az + 360) % 360
-    return major_axis, minor_axis, rot, half_bw
+    
+    return major_axis, minor_axis, rot
 
 def ellipse_points(clat, clon, major, minor, rot, num=100):
     t  = np.linspace(0, 2*np.pi, num)
@@ -143,6 +155,7 @@ def get_beams_with_contours():
 
 
 # --- Endpoint POST (Membuat & Menyimpan Beam, Versi Aman) ---
+# --- Endpoint POST (Membuat & Menyimpan Beam, VERSI PERBAIKAN) ---
 @beam_blueprint.route("/store-beam", methods=["POST"])
 @jwt_required()
 def store_beam():
@@ -159,24 +172,50 @@ def store_beam():
         return jsonify({"error": f"Invalid or missing field: {e}"}), 400
     
     try:
-        # 1. Validasi Kepemilikan Antena dan ambil data satelit terkait
+        # 1. Validasi Kepemilikan Antena dan ambil data satelit terkait (TETAP SAMA)
         sat = validate_antenna_and_get_satellite(ant_id, id_akun_login)
         if not sat:
             return jsonify({"error": "Forbidden. You do not own the antenna for this beam."}), 403
 
-        # 2. Lanjutkan kalkulasi
+        # 2. Ambil data pola radiasi (TETAP SAMA)
         gain_dB, theta_deg = fetch_gain_theta(ant_id)
-        maj, minr, rot, hbw = generate_spot_beam_properties(
-            clat, clon, gain_dB, theta_deg, sat["lon"], sat["lat"]
-        )
+        
+        # --- PERUBAHAN LOGIKA UTAMA DIMULAI DI SINI ---
+
+        # Buat fungsi interpolasi terbalik untuk mencari sudut dari gain
+        # Pastikan data diurutkan dengan benar untuk interp1d
+        sorted_indices = np.argsort(gain_dB)
+        gain_dB_sorted = np.array(gain_dB)[sorted_indices]
+        theta_deg_sorted = np.array(theta_deg)[sorted_indices]
+        
+        # Hapus duplikat pada gain untuk menghindari error di interp1d
+        unique_gains, unique_indices = np.unique(gain_dB_sorted, return_index=True)
+        unique_thetas = theta_deg_sorted[unique_indices]
+
+        inv_interp = interp1d(unique_gains, unique_thetas, kind='linear', fill_value="extrapolate", bounds_error=False)
 
         levels = []
+        # Loop untuk setiap level kontur yang ingin kita buat
         for level_val in (-1, -2, -3):
-            # Asumsi: half_bw tidak digunakan di sini, jadi kita abaikan
+            # Dapatkan radius angular (half-beamwidth) untuk level gain saat ini
+            angular_radius_deg = float(inv_interp(level_val))
+            
+            # Jika hasil interpolasi aneh (misal negatif karena ekstrapolasi), beri nilai default kecil
+            if angular_radius_deg <= 0:
+                angular_radius_deg = 0.01 
+
+            # Hitung properti elips (major, minor, rot) SPESIFIK untuk level ini
+            maj, minr, rot = generate_spot_beam_properties(
+                clat, clon, angular_radius_deg, sat["lon"], sat["lat"]
+            )
+
+            # Buat titik-titik elips berdasarkan properti yang baru dihitung
             points = ellipse_points(clat, clon, maj, minr, rot)
             levels.append({"level": level_val, "points": points})
             
-        # 3. Simpan ke Database
+        # --- AKHIR DARI PERUBAHAN LOGIKA UTAMA ---
+            
+        # 3. Simpan ke Database (TETAP SAMA)
         with get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -206,7 +245,7 @@ def store_beam():
         return jsonify({"error": f"Database error: {err}"}), 500
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
-
+    
 # --- Endpoint DELETE (Menghapus Beam dan Contours Terkait) ---
 @beam_blueprint.route("/delete-beam/<int:beam_id>", methods=["DELETE"])
 @jwt_required()
