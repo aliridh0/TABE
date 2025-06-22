@@ -361,7 +361,7 @@ def get_all_links():
             # SQL query dimodifikasi untuk JOIN dengan tabel default_link
             sql = """
                 SELECT 
-                    l.id, l.id_beam, b.clat, b.clon, l.distance, l.directivity, 
+                    l.id, l.lat, l.lon, l.id_beam, b.clat, b.clon, l.distance, l.directivity, 
                     l.cinr, l.evaluasi, l.ci, l.cn, l.gt, l.eirp, l.fsl, 
                     l.id_default,
                     d.dir_ground, d.tx_sat, d.suhu, d.bw, d.loss, d.ci_down

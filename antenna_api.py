@@ -4,7 +4,6 @@ from koneksi import get_conn, Error
 import numpy as np
 import math
 from scipy import special
-import json
 
 # --- Inisialisasi Blueprint ---
 antenna_blueprint = Blueprint('antenna', __name__)
@@ -50,22 +49,23 @@ def radiation_pattern(freq_GHz, bw3dB_deg, F_D, theta_range=(0, 12), n=1000):
     return theta_deg, pattern_dB
 
 
-# --- Endpoint POST (Membuat & Menyimpan Antena) ---
 @antenna_blueprint.route("/calculate", methods=["POST"])
 @jwt_required()
 def create_and_calculate_antenna():
+    # Dapatkan id_akun pengguna yang sedang login dari token JWT
     id_akun_login = get_jwt_identity()
     data = request.get_json()
+
     if not data:
         return jsonify({"error": "Invalid JSON payload"}), 400
 
+    # 1. Hapus 'id_satelite' dari parsing request, kita akan mencarinya di DB
     try:
         f_GHz = float(data["frequency"])
         bw3dB = float(data["bw3dB"])
         F_D   = float(data["F_D"])
         eff   = float(data.get("Effisiensi", 0.4364))
-        id_sat = data.get("id_satelite")
-        ant_name_input = data.get("name", "Untitled Antenna")
+        ant_name_input = data.get("name", "Untitled Antenna") # Nama awal tetap opsional
     except (KeyError, ValueError) as e:
         return jsonify({"error": f"Invalid or missing field: {e}"}), 400
 
@@ -73,23 +73,38 @@ def create_and_calculate_antenna():
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
 
-            if id_sat:
-                cur.execute("SELECT id FROM satelite WHERE id = %s AND id_akun = %s", (id_sat, id_akun_login))
-                if not cur.fetchone():
-                    return jsonify({"error": "Forbidden. You do not own this satellite."}), 403
+            # 2. Cari id_satelite di database berdasarkan id_akun dari JWT
+            #    Asumsi: Satu akun hanya memiliki satu satelit.
+            cur.execute("SELECT id FROM satelite WHERE id_akun = %s", (id_akun_login,))
+            satellite = cur.fetchone()
+
+            # 3. Handle kasus jika satelit untuk akun tersebut tidak ditemukan
+            if not satellite:
+                return jsonify({
+                    "error": "Satellite for your account not found.",
+                    "message": "Please create a satellite first before adding an antenna."
+                }), 404  # 404 Not Found lebih sesuai di sini
+
+            # Dapatkan id satelit dari hasil query
+            id_sat = satellite['id']
             
+            # 4. Blok validasi kepemilikan yang lama sudah tidak relevan dan bisa dihapus
+            #    karena kita sudah pasti mendapatkan satelit milik user yang login.
+
+            # Lakukan kalkulasi seperti biasa
             direct_dB = calculate_directivity(f_GHz, bw3dB, eff)
             theta, pattern = radiation_pattern(f_GHz, bw3dB, F_D)
 
-            # --- PERUBAHAN DI SINI: Tambahkan frekuensi ke dalam query INSERT ---
+            # Query INSERT sekarang menggunakan id_sat yang kita temukan
             insert_ant_sql = "INSERT INTO antena (name, frekuensi, bw3db_deg, eff, f_d, directivity, id_satelite) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-            # --- PERUBAHAN DI SINI: Tambahkan f_GHz ke dalam tuple values ---
             cur.execute(insert_ant_sql, (ant_name_input, f_GHz, bw3dB, eff, F_D, direct_dB, id_sat))
             ant_id = cur.lastrowid
 
-            final_ant_name = f"sat{id_sat}_ant{ant_id}" if id_sat else f"ant{ant_id}"
+            # Buat nama antena yang lebih deskriptif dan update ke database
+            final_ant_name = f"antenna-{ant_id}"
             cur.execute("UPDATE antena SET name = %s WHERE id = %s", (final_ant_name, ant_id))
 
+            # Simpan data radiasi (theta & pattern)
             theta_rows = [(float(t), ant_id) for t in theta]
             pattern_rows = [(float(p), ant_id) for p in pattern]
             cur.executemany("INSERT INTO theta (deg, id_antena) VALUES (%s, %s)", theta_rows)
@@ -97,9 +112,16 @@ def create_and_calculate_antenna():
 
             conn.commit()
 
+            # Siapkan respons JSON dengan data lengkap
             antenna_dict = {
-                "id": ant_id, "name": final_ant_name, "frequency_GHz": f_GHz, "bw3dB": bw3dB, # <-- Ditambahkan di respons
-                "efficiency": eff, "F_D": F_D, "directivity_dB": direct_dB, "id_satellite": id_sat,
+                "id": ant_id,
+                "name": final_ant_name,
+                "frequency_GHz": f_GHz,
+                "bw3dB": bw3dB,
+                "efficiency": eff,
+                "F_D": F_D,
+                "directivity_dB": direct_dB,
+                "id_satellite": id_sat, # id satelit yang ditemukan secara otomatis
                 "theta_deg": [float(t) for t in theta],
                 "pattern_dB": [float(p) for p in pattern]
             }
@@ -109,7 +131,6 @@ def create_and_calculate_antenna():
         return jsonify({"error": f"Database error: {err}"}), 500
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
-
 
 # --- Endpoint GET All (Versi Aman dengan Logika Query Asli Anda) ---
 @antenna_blueprint.route("/get-antennas", methods=["GET"])
