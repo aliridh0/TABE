@@ -9,7 +9,6 @@ from scipy import special
 antenna_blueprint = Blueprint('antenna', __name__)
 
 # --- Fungsi Perhitungan ---
-# (Tidak ada perubahan di sini)
 def calculate_directivity(freq_GHz, bw3dB_deg, eff=0.4364):
     c = 3e8
     bw_rad = math.radians(bw3dB_deg)
