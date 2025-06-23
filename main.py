@@ -32,6 +32,5 @@ app.register_blueprint(link_budget_bp, url_prefix='/link_budget')
 def index():
     return jsonify({"message": "Welcome! Available prefixes: /satellite, /antenna, /beam, /user, /link_budget"})
 
-# Run the application
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
