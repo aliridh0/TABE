@@ -18,7 +18,7 @@ app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'  # Replace with your actual
 # Initialize the JWT manager
 jwt = JWTManager(app)
 
-CORS(app, origins="http://localhost:3000")
+CORS(app, origins="*")
 
 # Register Blueprints
 app.register_blueprint(satellite_blueprint, url_prefix='/satellite')
