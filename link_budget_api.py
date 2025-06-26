@@ -177,6 +177,7 @@ def calculate_link_budget(params):
         return {"status": "error", "message": f"Kesalahan matematis dalam kalkulasi: {e}"}
 
 # --- Endpoint POST ---
+# --- Endpoint POST (VERSI FINAL PALING ROBUST) ---
 @link_budget_bp.route("/calculate", methods=["POST"])
 @jwt_required()
 def calculate_link():
@@ -194,32 +195,60 @@ def calculate_link():
     try:
         with get_conn() as conn:
             profile_id_to_use = 1
+            
+            # Selalu mulai dengan mengambil parameter dasar
+            params_from_db = fetch_link_budget_defaults(1)
+            if not params_from_db:
+                return jsonify({"error": "Base default profile (ID=1) not found in database."}), 500
+            
+            # Jadikan `params` sebagai variabel kerja utama
+            params = params_from_db.copy()
+
             if link_params_custom:
-                base_params = fetch_link_budget_defaults(1)
-                if not base_params: return jsonify({"error": "Base default profile (ID=1) not found."}), 500
-                final_params_for_insert = {**base_params, **link_params_custom}
+                # Jika ada parameter kustom, gabungkan dengan parameter dasar
+                params.update(link_params_custom)
                 
-                cur_insert = conn.cursor()
-                sql_insert = "INSERT INTO default_link (dir_ground, tx_sat, suhu, bw, loss, ci_down) VALUES (%s, %s, %s, %s, %s, %s)"
-                cur_insert.execute(sql_insert, (final_params_for_insert['dir_ground'], final_params_for_insert['tx_sat'], final_params_for_insert['suhu'], final_params_for_insert['bw'], final_params_for_insert['loss'], final_params_for_insert['ci_down']))
-                profile_id_to_use = cur_insert.lastrowid
-                cur_insert.close()
+                # --- LOGIKA BARU: "CARI ATAU BUAT" ---
+                cur_check = conn.cursor(dictionary=True)
+                
+                # 1. CARI: Apakah profil dengan parameter persis seperti ini sudah ada?
+                sql_check = """
+                    SELECT id FROM default_link 
+                    WHERE dir_ground = %s AND tx_sat = %s AND suhu = %s 
+                      AND bw = %s AND loss = %s AND ci_down = %s
+                """
+                check_values = (
+                    params['dir_ground'], params['tx_sat'], params['suhu'], 
+                    params['bw'], params['loss'], params['ci_down']
+                )
+                cur_check.execute(sql_check, check_values)
+                existing_profile = cur_check.fetchone()
+                cur_check.close()
 
-            params = fetch_link_budget_defaults(profile_id_to_use)
-            if not params: return jsonify({"error": "Failed to fetch parameters for calculation."}), 500
-
+                if existing_profile:
+                    # 2A. JIKA ADA: Gunakan ID yang sudah ada
+                    profile_id_to_use = existing_profile['id']
+                else:
+                    # 2B. JIKA TIDAK ADA: Baru lakukan INSERT untuk membuat yang baru
+                    cur_insert = conn.cursor()
+                    sql_insert = "INSERT INTO default_link (dir_ground, tx_sat, suhu, bw, loss, ci_down) VALUES (%s, %s, %s, %s, %s, %s)"
+                    cur_insert.execute(sql_insert, check_values) # Gunakan values yang sama
+                    profile_id_to_use = cur_insert.lastrowid
+                    cur_insert.close()
+            
+            # Lanjutan proses kalkulasi...
+            # `params` sudah berisi data yang benar, baik dari profil lama maupun baru.
+            
             sat = fetch_satellite_by_account(id_akun_login)
             if not sat: return jsonify({"error": f"Satellite for account id {id_akun_login} not found"}), 404
             
             all_beams = fetch_all_beams_by_account(id_akun_login)
             if not all_beams: return jsonify({"error": "No beam data available for your account"}), 404
             
-            # Cari beam terdekat berdasarkan jarak permukaan (Haversine)
             for b in all_beams:
                 b["_surface_distance"] = haversine(obs_lat, obs_lon, b["clat"], b["clon"])
             best_beam_initial = min(all_beams, key=lambda x: x["_surface_distance"])
             
-            # --- REVISI 2: Gunakan id_antena dari beam terbaik, bukan di-hardcode ---
             id_antena_terbaik = best_beam_initial['id_antena']
             _, ant_eff, ant_freq_ghz, theta_axis, gain_axis = fetch_antenna_pattern(id_antena_terbaik)
             if theta_axis is None: return jsonify({"error": f"Pattern data for antenna id {id_antena_terbaik} not found"}), 404
@@ -230,7 +259,7 @@ def calculate_link():
             best_beam = {
                 "id": best_beam_initial["id"], "lat": best_beam_initial["clat"], "lon": best_beam_initial["clon"],
                 "id_antena": id_antena_terbaik, "distance_to_obs_km": round(distance_final,2),
-                "directivity_at_obs_dBi": (directivity_final)
+                "directivity_at_obs_dBi": directivity_final
             }
             
             params.update({
@@ -259,11 +288,11 @@ def calculate_link():
             final_response = {"message": "Calculation successful and data stored.", "link_id": link_id_new, "best_beam_found": best_beam, "link_budget_result": link_budget_result, "profile_id_used": profile_id_to_use}
             return jsonify(final_response)
 
-    except (Error, ValueError) as e: # Tangkap juga ValueError dari fetch_antenna_pattern
+    except (Error, ValueError) as e: 
         return jsonify({"error": f"Operation failed: {e}"}), 500
     except Exception as e:
         return jsonify({"error": f"An unexpected server error occurred: {e}"}), 500
-
+    
 # --- Endpoint PUT untuk Update/Re-calculate (VERSI FINAL DENGAN LOGIKA YANG DISAMAKAN) ---
 @link_budget_bp.route("/link/<int:link_id>", methods=["PUT"])
 @jwt_required()
