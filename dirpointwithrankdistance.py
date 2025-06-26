@@ -296,7 +296,7 @@ if __name__ == "__main__":
     for i, beam in enumerate(beams_info):
         print(f"  {i+1}. {beam['name']} (Lat: {beam['lat']:.2f}, Lon: {beam['lon']:.2f}) - "
               f"Jarak: {beam['distance_to_obs_km']:.2f} km, "
-              f"Directivity di Bandung: {beam['directivity_at_obs_dBi']:.2f} dBi")
+              f"Directivity: {beam['directivity_at_obs_dBi']:.2f} dBi")
 
     # --- 5. Ambil 3 Besar Berdasarkan Jarak ---
     top_n_by_distance = 3

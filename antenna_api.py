@@ -21,8 +21,9 @@ def calculate_directivity(freq_GHz, bw3dB_deg, eff=0.4364):
 def radiation_pattern(freq_GHz, bw3dB_deg, F_D, theta_range=(0, 12), n=1000):
     c = 3e8
     lam = c / (freq_GHz * 1e9)
+    bw_rad = math.radians(bw3dB_deg)
     k = 2 * math.pi / lam
-    D = bw3dB_deg * F_D
+    D = 1.06505 * lam / bw_rad
     a = D / 2
     wg_r = 0.002
     theta_deg = np.linspace(theta_range[0], theta_range[1], n)
