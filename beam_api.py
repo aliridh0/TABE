@@ -53,6 +53,30 @@ def ellipse_points(clat, clon, major, minor, rot, num=100):
     yr = x*np.sin(rot) + y*np.cos(rot)
     return [[clat + yr[i], clon + xr[i]] for i in range(num)]
 
+def create_inverse_interpolator(gain_dB, theta_deg):
+    # REVISI PENTING: Helper baru untuk memusatkan logika persiapan data interpolasi
+    if not gain_dB or not theta_deg:
+        raise ValueError("Input gain_dB and theta_deg cannot be empty.")
+    
+    # 1. Gabungkan data & urutkan berdasarkan gain (sumbu X) secara menaik
+    pattern_data = sorted(zip(gain_dB, theta_deg))
+
+    # 2. Filter untuk memastikan gain unik (ambil yang pertama kali muncul)
+    unique_pattern_data = []
+    last_gain = float('-inf')
+    for gain, theta in pattern_data:
+        if gain > last_gain:
+            unique_pattern_data.append([gain, theta])
+            last_gain = gain
+    
+    if len(unique_pattern_data) < 2:
+        raise ValueError("Not enough unique data points to create interpolation function.")
+    
+    # 3. Pisahkan kembali menjadi array yang bersih & siap pakai
+    final_gains, final_thetas = zip(*unique_pattern_data)
+    
+    # 4. Buat dan kembalikan fungsi interpolasi
+    return interp1d(final_gains, final_thetas, kind='linear', fill_value="extrapolate", bounds_error=False)
 
 # --- Fungsi Helper Query (Diperbarui) ---
 
@@ -80,6 +104,7 @@ def validate_antenna_and_get_satellite(id_antena, id_akun):
         return None
 
 def fetch_gain_theta(ant_id):
+    # REVISI PENTING: Menambahkan validasi untuk mencegah error 'index out of bounds'
     try:
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
@@ -87,11 +112,16 @@ def fetch_gain_theta(ant_id):
             theta_deg = [row["deg"] for row in cur.fetchall()]
             cur.execute("SELECT deg FROM pattern WHERE id_antena = %s ORDER BY id", (ant_id,))
             pattern_dB = [row["deg"] for row in cur.fetchall()]
-            cur.close()
-            if theta_deg and pattern_dB:
-                return pattern_dB, theta_deg
-            else:
-                raise ValueError(f"Gain/theta data not found for antenna id {ant_id}")
+
+            if len(theta_deg) != len(pattern_dB):
+                raise ValueError(
+                    f"Data mismatch for antenna ID {ant_id}. "
+                    f"Found {len(theta_deg)} theta points but {len(pattern_dB)} pattern points. "
+                    "Please check database integrity."
+                )
+            if not theta_deg:
+                raise ValueError(f"No gain/theta data found for antenna id {ant_id}")
+            return pattern_dB, theta_deg
     except Error as e:
         raise Exception(f"Database error while fetching gain/theta: {e}")
 
@@ -245,20 +275,19 @@ def store_beam():
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
     
-# --- Endpoint POST (Membuat & Menyimpan BANYAK Beam via Array, Format Baru) ---
+# --- ENDPOINT-ENDPOINT ---
+
 @beam_blueprint.route("/store-beams", methods=["POST"])
 @jwt_required()
 def store_beams_batch():
     id_akun_login = get_jwt_identity()
     data = request.get_json()
     
-    # --- PERUBAHAN 1: Validasi input disesuaikan dengan key 'points' ---
     if not data or "id_antena" not in data or "points" not in data:
         return jsonify({"error": "Request body must contain 'id_antena' and an array of 'points'."}), 400
 
     try:
         ant_id = int(data["id_antena"])
-        # --- PERUBAHAN 2: Variabel sekarang bernama 'points_array' ---
         points_array = data["points"]
         if not isinstance(points_array, list) or not points_array:
             return jsonify({"error": "'points' must be a non-empty array."}), 400
@@ -266,93 +295,61 @@ def store_beams_batch():
         return jsonify({"error": f"Invalid format for 'id_antena' or 'points': {e}"}), 400
     
     try:
-        # Persiapan yang dilakukan sekali saja (TIDAK BERUBAH)
+        # Persiapan yang dilakukan sekali saja
         sat = validate_antenna_and_get_satellite(ant_id, id_akun_login)
         if not sat:
             return jsonify({"error": "Forbidden. You do not own the antenna for these beams."}), 403
 
         gain_dB, theta_deg = fetch_gain_theta(ant_id)
         
-        sorted_indices = np.argsort(gain_dB)
-        gain_dB_sorted = np.array(gain_dB)[sorted_indices]
-        theta_deg_sorted = np.array(theta_deg)[sorted_indices]
-        unique_gains, unique_indices = np.unique(gain_dB_sorted, return_index=True)
-        unique_thetas = theta_deg_sorted[unique_indices]
-        inv_interp = interp1d(unique_gains, unique_thetas, kind='linear', fill_value="extrapolate", bounds_error=False)
+        # Panggil helper baru untuk dapatkan fungsi interpolasi yang sudah aman
+        inv_interp = create_inverse_interpolator(gain_dB, theta_deg)
 
         newly_created_beam_ids = []
-
         with get_conn() as conn:
             cur = conn.cursor()
             
-            # --- PERUBAHAN 3: Loop sekarang melalui 'points_array' ---
             for point_coords in points_array:
                 try:
-                    # Pastikan setiap item adalah list/tuple dengan 2 elemen angka
                     if not isinstance(point_coords, (list, tuple)) or len(point_coords) != 2:
                         raise ValueError("Each point must be an array of two numbers.")
-                    
-                    # --- PERUBAHAN 4: Akses lat/lon menggunakan indeks [0] dan [1] ---
-                    clat = float(point_coords[0])
-                    clon = float(point_coords[1])
+                    clat, clon = float(point_coords[0]), float(point_coords[1])
                 except (ValueError, TypeError, IndexError) as e:
-                    conn.rollback()
-                    return jsonify({
-                        "error": f"Invalid format in points array: '{point_coords}'. Each point must be an array of [latitude, longitude].",
-                        "details": str(e)
-                    }), 400
+                    return jsonify({"error": f"Invalid format in points array: '{point_coords}'. Each point must be an array of [latitude, longitude].", "details": str(e)}), 400
 
-                # Logika kalkulasi kontur (TIDAK BERUBAH)
                 levels = []
                 for level_val in (-1, -2, -3):
                     angular_radius_deg = float(inv_interp(level_val))
                     if angular_radius_deg <= 0:
-                        angular_radius_deg = 0.01 
+                        angular_radius_deg = 0.01
 
-                    # Di sini diasumsikan Anda telah mengganti nama fungsi lama ke yang baru
-                    maj, minr, rot = generate_spot_beam_properties(
-                        clat, clon, angular_radius_deg, sat["lon"]
-                    )
+                    maj, minr, rot = generate_spot_beam_properties(clat, clon, angular_radius_deg, sat["lon"], sat["lat"])
                     points = ellipse_points(clat, clon, maj, minr, rot)
                     levels.append({"level": level_val, "points": points})
 
-                # Logika penyimpanan ke DB (TIDAK BERUBAH)
-                cur.execute(
-                    "INSERT INTO beam (clat, clon, id_antena) VALUES (%s, %s, %s)",
-                    (clat, clon, ant_id)
-                )
+                cur.execute("INSERT INTO beam (clat, clon, id_antena) VALUES (%s, %s, %s)", (clat, clon, ant_id))
                 beam_id = cur.lastrowid
                 if not beam_id:
                     conn.rollback()
                     return jsonify({"error": "Failed to get beam ID after insertion."}), 500
-                
                 newly_created_beam_ids.append(beam_id)
 
-                all_contour_data = []
-                for level in levels:
-                    level_data = [
-                        (level["level"], float(p[0]), float(p[1]), beam_id)
-                        for p in level["points"]
-                    ]
-                    all_contour_data.extend(level_data)
-                
+                all_contour_data = [
+                    (level["level"], float(p[0]), float(p[1]), beam_id)
+                    for level in levels for p in level["points"]
+                ]
                 if all_contour_data:
-                    cur.executemany(
-                        "INSERT INTO countour (level, lat, lon, id_beam) VALUES (%s, %s, %s, %s)",
-                        all_contour_data
-                    )
+                    cur.executemany("INSERT INTO countour (level, lat, lon, id_beam) VALUES (%s, %s, %s, %s)", all_contour_data)
             
             conn.commit()
 
-        return jsonify({
-            "message": f"Successfully stored {len(newly_created_beam_ids)} beams.",
-            "beam_ids": newly_created_beam_ids
-        }), 201
+        return jsonify({"message": f"Successfully stored {len(newly_created_beam_ids)} beams.", "beam_ids": newly_created_beam_ids}), 201
 
-    except Error as err:
-        return jsonify({"error": f"Database error: {err}"}), 500
+    except (Error, ValueError) as err: # Menangkap ValueError juga dari helper
+        return jsonify({"error": f"Operation failed: {err}"}), 500
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
     
 # --- Endpoint DELETE (Menghapus Beam dan Contours Terkait) ---
 @beam_blueprint.route("/delete-beam/<int:beam_id>", methods=["DELETE"])
