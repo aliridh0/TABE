@@ -176,8 +176,7 @@ def calculate_link_budget(params):
     except Exception as e:
         return {"status": "error", "message": f"Kesalahan matematis dalam kalkulasi: {e}"}
 
-# --- Endpoint POST ---
-# --- Endpoint POST (VERSI FINAL PALING ROBUST) ---
+# --- Endpoint POST (VERSI FINAL DENGAN PERHITUNGAN DIRECTIVITY YANG BENAR) ---
 @link_budget_bp.route("/calculate", methods=["POST"])
 @jwt_required()
 def calculate_link():
@@ -208,10 +207,9 @@ def calculate_link():
                 # Jika ada parameter kustom, gabungkan dengan parameter dasar
                 params.update(link_params_custom)
                 
-                # --- LOGIKA BARU: "CARI ATAU BUAT" ---
+                # --- LOGIKA "CARI ATAU BUAT" PROFIL ---
                 cur_check = conn.cursor(dictionary=True)
                 
-                # 1. CARI: Apakah profil dengan parameter persis seperti ini sudah ada?
                 sql_check = """
                     SELECT id FROM default_link 
                     WHERE dir_ground = %s AND tx_sat = %s AND suhu = %s 
@@ -226,18 +224,17 @@ def calculate_link():
                 cur_check.close()
 
                 if existing_profile:
-                    # 2A. JIKA ADA: Gunakan ID yang sudah ada
+                    # JIKA ADA: Gunakan ID yang sudah ada
                     profile_id_to_use = existing_profile['id']
                 else:
-                    # 2B. JIKA TIDAK ADA: Baru lakukan INSERT untuk membuat yang baru
+                    # JIKA TIDAK ADA: Baru lakukan INSERT untuk membuat yang baru
                     cur_insert = conn.cursor()
                     sql_insert = "INSERT INTO default_link (dir_ground, tx_sat, suhu, bw, loss, ci_down) VALUES (%s, %s, %s, %s, %s, %s)"
-                    cur_insert.execute(sql_insert, check_values) # Gunakan values yang sama
+                    cur_insert.execute(sql_insert, check_values)
                     profile_id_to_use = cur_insert.lastrowid
                     cur_insert.close()
             
-            # Lanjutan proses kalkulasi...
-            # `params` sudah berisi data yang benar, baik dari profil lama maupun baru.
+            # --- Lanjutan Proses Kalkulasi ---
             
             sat = fetch_satellite_by_account(id_akun_login)
             if not sat: return jsonify({"error": f"Satellite for account id {id_akun_login} not found"}), 404
@@ -245,47 +242,82 @@ def calculate_link():
             all_beams = fetch_all_beams_by_account(id_akun_login)
             if not all_beams: return jsonify({"error": "No beam data available for your account"}), 404
             
+            # Pilih beam terdekat berdasarkan jarak permukaan
             for b in all_beams:
                 b["_surface_distance"] = haversine(obs_lat, obs_lon, b["clat"], b["clon"])
             best_beam_initial = min(all_beams, key=lambda x: x["_surface_distance"])
             
             id_antena_terbaik = best_beam_initial['id_antena']
-            _, ant_eff, ant_freq_ghz, theta_axis, gain_axis = fetch_antenna_pattern(id_antena_terbaik)
+            
+            # --- PERHITUNGAN DIRECTIVITY YANG SUDAH DIPERBAIKI ---
+
+            # 1. Ambil directivity puncak dari fetch_antenna_pattern
+            peak_directivity_dBi, ant_eff, ant_freq_ghz, theta_axis, gain_axis = fetch_antenna_pattern(id_antena_terbaik)
             if theta_axis is None: return jsonify({"error": f"Pattern data for antenna id {id_antena_terbaik} not found"}), 404
 
+            # 2. Hitung jarak 3D dan sudut off-axis
             theta_off_final, distance_final = off_axis(sat["lat"], sat["lon"], sat["alt"], best_beam_initial["clat"], best_beam_initial["clon"], obs_lat, obs_lon)
-            directivity_final = gain_from_pattern(theta_off_final, theta_axis, gain_axis)
             
+            # 3. Hitung penurunan gain dari pola radiasi (hasilnya negatif)
+            gain_drop_off_dB = gain_from_pattern(theta_off_final, theta_axis, gain_axis)
+
+            # 4. Hitung directivity absolut di lokasi observer
+            directivity_final_abs = peak_directivity_dBi + gain_drop_off_dB
+            
+            # --- AKHIR BLOK PERBAIKAN ---
+
+            # Buat dictionary untuk informasi beam terbaik
             best_beam = {
-                "id": best_beam_initial["id"], "lat": best_beam_initial["clat"], "lon": best_beam_initial["clon"],
-                "id_antena": id_antena_terbaik, "distance_to_obs_km": round(distance_final,2),
-                "directivity_at_obs_dBi": directivity_final
+                "id": best_beam_initial["id"], 
+                "lat": best_beam_initial["clat"], 
+                "lon": best_beam_initial["clon"],
+                "id_antena": id_antena_terbaik, 
+                "distance_to_obs_km": round(distance_final, 2),
+                "directivity_at_obs_dBi": round(directivity_final_abs, 2)
             }
             
+            # Update dictionary params dengan nilai dinamis yang sudah dihitung
             params.update({
-                'directivity_satelit_tx_dBi': best_beam['directivity_at_obs_dBi'],
-                'jarak_km': best_beam['distance_to_obs_km'],
+                'directivity_satelit_tx_dBi': directivity_final_abs,
+                'jarak_km': distance_final,
                 'efisiensi_antena': float(ant_eff),
                 'frekuensi_GHz': float(ant_freq_ghz)
             })
 
+            # Lakukan kalkulasi link budget
             link_budget_result = calculate_link_budget(params)
             if link_budget_result['status'] == 'error': return jsonify({"error": link_budget_result['message']}), 500
 
-            # Simpan hasil ke tabel 'link'
+            # Simpan hasil akhir ke tabel 'link'
             cur_insert_link = conn.cursor()
             sql = "INSERT INTO link (id_beam, id_default, distance, lat, lon, directivity, cinr, evaluasi, ci, cn, gt, eirp, fsl) VALUES (%s,%s,%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
             p = link_budget_result['perhitungan']
             values = (
-                int(best_beam['id']), int(profile_id_to_use), float(best_beam['distance_to_obs_km']), obs_lat, obs_lon, float(best_beam['directivity_at_obs_dBi']),
-                float(link_budget_result['cinr_dB']), str(link_budget_result['evaluasi']), float(p['c_per_i_downlink_db']),
-                float(p['c_per_n_downlink_dB']), float(p['g_per_t_stasiun_bumi_dBK']), float(p['eirp_downlink_dBW']), float(p['free_space_loss_dB'])
+                int(best_beam['id']), 
+                int(profile_id_to_use), 
+                float(best_beam['distance_to_obs_km']), 
+                obs_lat, 
+                obs_lon, 
+                float(best_beam['directivity_at_obs_dBi']), # Menyimpan directivity absolut
+                float(link_budget_result['cinr_dB']), 
+                str(link_budget_result['evaluasi']), 
+                float(p['c_per_i_downlink_db']),
+                float(p['c_per_n_downlink_dB']), 
+                float(p['g_per_t_stasiun_bumi_dBK']), 
+                float(p['eirp_downlink_dBW']), 
+                float(p['free_space_loss_dB'])
             )
             cur_insert_link.execute(sql, values)
             link_id_new = cur_insert_link.lastrowid
             conn.commit()
             
-            final_response = {"message": "Calculation successful and data stored.", "link_id": link_id_new, "best_beam_found": best_beam, "link_budget_result": link_budget_result, "profile_id_used": profile_id_to_use}
+            final_response = {
+                "message": "Calculation successful and data stored.", 
+                "link_id": link_id_new, 
+                "best_beam_found": best_beam, 
+                "link_budget_result": link_budget_result, 
+                "profile_id_used": profile_id_to_use
+            }
             return jsonify(final_response)
 
     except (Error, ValueError) as e: 
@@ -293,7 +325,7 @@ def calculate_link():
     except Exception as e:
         return jsonify({"error": f"An unexpected server error occurred: {e}"}), 500
     
-# --- Endpoint PUT untuk Update/Re-calculate (VERSI FINAL DENGAN LOGIKA YANG DISAMAKAN) ---
+# --- Endpoint PUT untuk Update/Re-calculate (VERSI FINAL DENGAN PEMILIHAN BEAM ID) ---
 @link_budget_bp.route("/link/<int:link_id>", methods=["PUT"])
 @jwt_required()
 def update_link(link_id):
@@ -303,21 +335,24 @@ def update_link(link_id):
         return jsonify({"error": "Request body must contain 'link_params' with new parameters."}), 400
     
     link_params_custom = data["link_params"]
+    
+    # --- PERUBAHAN 1: Ambil input opsional untuk pemilihan beam manual berdasarkan ID ---
     new_obs_lat = data.get("obs_lat")
     new_obs_lon = data.get("obs_lon")
+    ref_beam_id = data.get("ref_beam_id") # ID dari beam yang ingin dirujuk
 
     try:
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
             
-            # 1. Validasi link lama masih ada dan milik user
+            # 1. Validasi link lama (tidak ada perubahan)
             sql_validate = "SELECT l.id, l.lat, l.lon, l.id_default FROM link AS l JOIN beam AS b ON l.id_beam = b.id JOIN antena AS a ON b.id_antena = a.id JOIN satelite AS s ON a.id_satelite = s.id WHERE s.id_akun = %s AND l.id = %s"
             cur.execute(sql_validate, (id_akun_login, link_id))
             link_info = cur.fetchone()
             if not link_info:
                 return jsonify({"error": "Link not found or you do not have permission to update it."}), 404
 
-            # 2. Tentukan koordinat mana yang akan digunakan
+            # 2. Tentukan koordinat observasi (tidak ada perubahan)
             lat_for_recalc, lon_for_recalc = None, None
             if new_obs_lat is not None and new_obs_lon is not None:
                 try:
@@ -327,22 +362,43 @@ def update_link(link_id):
             else:
                 lat_for_recalc, lon_for_recalc = link_info['lat'], link_info['lon']
 
-            # --- PERUBAHAN LOGIKA UTAMA: CARI ULANG BEAM TERBAIK ---
-            # 3. Ambil semua beam yang tersedia untuk user
+            # 3. Ambil semua beam yang tersedia (tidak ada perubahan)
             all_beams = fetch_all_beams_by_account(id_akun_login)
             if not all_beams:
                 return jsonify({"error": "No beam data available for your account to perform recalculation."}), 404
 
-            # 4. Cari beam terdekat dengan lokasi (baru atau lama)
-            for b in all_beams:
-                b["_surface_distance"] = haversine(lat_for_recalc, lon_for_recalc, b["clat"], b["clon"])
-            
-            # Ini adalah beam terbaik yang SEHARUSNYA digunakan untuk lokasi saat ini
-            best_beam_for_update = min(all_beams, key=lambda x: x["_surface_distance"])
-            id_antena_terbaik = best_beam_for_update['id_antena']
-            # -----------------------------------------------------------
+            # --- PERUBAHAN 2: Logika Pemilihan Beam (Manual by ID atau Otomatis) ---
+            best_beam_for_update = None
+            selection_method_info = ""
 
-            # 5. Logika untuk mengelola profil link (tidak berubah)
+            # Jika pengguna memberikan ID beam referensi
+            if ref_beam_id is not None:
+                try:
+                    ref_id = int(ref_beam_id)
+                except (ValueError, TypeError):
+                    return jsonify({"error": "Invalid format for 'ref_beam_id'. It must be an integer."}), 400
+
+                # Cari beam yang cocok berdasarkan ID dari daftar beam milik user
+                found_beam = next((beam for beam in all_beams if beam['id'] == ref_id), None)
+                
+                if not found_beam:
+                    return jsonify({"error": f"The specified reference beam with ID {ref_id} was not found for your account."}), 404
+                
+                best_beam_for_update = found_beam
+                selection_method_info = f"Recalculated using manually specified beam ID {best_beam_for_update['id']}."
+
+            # Jika tidak ada input manual, gunakan logika otomatis (paling dekat)
+            else:
+                for b in all_beams:
+                    b["_surface_distance"] = haversine(lat_for_recalc, lon_for_recalc, b["clat"], b["clon"])
+                
+                best_beam_for_update = min(all_beams, key=lambda x: x["_surface_distance"])
+                selection_method_info = f"Recalculated using automatically selected nearest beam ID {best_beam_for_update['id']}."
+            # --------------------------------------------------------------------
+
+            id_antena_terbaik = best_beam_for_update['id_antena']
+
+            # 5. Logika untuk mengelola profil link (tidak ada perubahan)
             current_default_id = link_info['id_default']
             base_params = fetch_link_budget_defaults(1)
             if not base_params: return jsonify({"error": "Base default profile (ID=1) not found."}), 500
@@ -351,7 +407,6 @@ def update_link(link_id):
             profile_id_to_use = None
             message = ""
             if current_default_id == 1:
-                # ... (logika insert profil baru tidak berubah)
                 cur_manage_default = conn.cursor()
                 sql_insert_default = "INSERT INTO default_link (dir_ground, tx_sat, suhu, bw, loss, ci_down) VALUES (%s, %s, %s, %s, %s, %s)"
                 cur_manage_default.execute(sql_insert_default, (final_params['dir_ground'], final_params['tx_sat'], final_params['suhu'], final_params['bw'], final_params['loss'], final_params['ci_down']))
@@ -359,7 +414,6 @@ def update_link(link_id):
                 message = f"Link ID {link_id} updated by creating a new custom profile ID {profile_id_to_use}."
                 cur_manage_default.close()
             else:
-                # ... (logika update profil lama tidak berubah)
                 cur_manage_default = conn.cursor()
                 sql_update_default = "UPDATE default_link SET dir_ground=%s, tx_sat=%s, suhu=%s, bw=%s, loss=%s, ci_down=%s WHERE id=%s"
                 cur_manage_default.execute(sql_update_default, (final_params['dir_ground'], final_params['tx_sat'], final_params['suhu'], final_params['bw'], final_params['loss'], final_params['ci_down'], current_default_id))
@@ -369,24 +423,36 @@ def update_link(link_id):
 
             params = final_params.copy()
 
-            # 6. Lanjutkan proses re-kalkulasi dengan menggunakan beam terbaik yang BARU ditemukan
+            # 6. Lanjutkan proses re-kalkulasi (tidak ada perubahan)
             sat = fetch_satellite_by_account(id_akun_login)
-            _, ant_eff, ant_freq_ghz, theta_axis, gain_axis = fetch_antenna_pattern(id_antena_terbaik)
+            
+            # 1. Ambil directivity puncak dari fetch_antenna_pattern
+            peak_directivity_dBi, ant_eff, ant_freq_ghz, theta_axis, gain_axis = fetch_antenna_pattern(id_antena_terbaik)
             if theta_axis is None:
                 return jsonify({"error": f"Pattern data not found for antenna ID: {id_antena_terbaik}"}), 404
 
             theta_off, distance = off_axis(sat["lat"], sat["lon"], sat["alt"], best_beam_for_update["clat"], best_beam_for_update["clon"], lat_for_recalc, lon_for_recalc)
-            directivity = gain_from_pattern(theta_off, theta_axis, gain_axis)
+            
+            # 2. Hitung penurunan gain
+            gain_drop_off_dB = gain_from_pattern(theta_off, theta_axis, gain_axis)
+            
+            # 3. Hitung directivity absolut
+            directivity_abs = peak_directivity_dBi + gain_drop_off_dB
+            
+            # --- AKHIR PERUBAHAN ---
             
             params.update({
-                'directivity_satelit_tx_dBi': directivity, 'jarak_km': distance,
-                'efisiensi_antena': float(ant_eff), 'frekuensi_GHz': float(ant_freq_ghz)
+                # 4. Gunakan nilai directivity absolut yang baru
+                'directivity_satelit_tx_dBi': directivity_abs, 
+                'jarak_km': distance,
+                'efisiensi_antena': float(ant_eff), 
+                'frekuensi_GHz': float(ant_freq_ghz)
             })
 
             link_budget_result = calculate_link_budget(params)
             if link_budget_result['status'] == 'error': return jsonify({"error": link_budget_result['message']}), 500
             
-            # 7. Update tabel link dengan SEMUA data baru, termasuk id_beam yang baru
+            # 7. Update tabel link dengan nilai directivity yang sudah absolut
             cur_update = conn.cursor()
             sql_update_link = """
                 UPDATE link SET id_beam=%s, id_default=%s, distance=%s, lat=%s, lon=%s, directivity=%s, 
@@ -395,9 +461,11 @@ def update_link(link_id):
             """
             p = link_budget_result['perhitungan']
             values = (
-                best_beam_for_update['id'], # <--- Simpan ID beam terbaik yang baru
+                best_beam_for_update['id'], 
                 profile_id_to_use, float(distance), lat_for_recalc, lon_for_recalc, 
-                float(directivity), float(link_budget_result['cinr_dB']),
+                # 5. Simpan nilai directivity absolut
+                float(directivity_abs), 
+                float(link_budget_result['cinr_dB']),
                 str(link_budget_result['evaluasi']), float(p['c_per_i_downlink_db']), float(p['c_per_n_downlink_dB']),
                 float(p['g_per_t_stasiun_bumi_dBK']), float(p['eirp_downlink_dBW']), float(p['free_space_loss_dB']),
                 link_id
@@ -405,7 +473,8 @@ def update_link(link_id):
             cur_update.execute(sql_update_link, values)
             conn.commit()
 
-            return jsonify({"message": message, "new_link_data": link_budget_result})
+            final_message = f"{message} {selection_method_info}"
+            return jsonify({"message": final_message, "new_link_data": link_budget_result})
 
     except (Error, ValueError) as e:
         return jsonify({"error": f"Operation failed: {e}"}), 500
