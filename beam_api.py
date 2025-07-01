@@ -126,7 +126,7 @@ def fetch_gain_theta(ant_id):
         raise Exception(f"Database error while fetching gain/theta: {e}")
 
 
-# --- Endpoint GET All Beams (Versi Aman) ---
+# --- Endpoint GET All Beams (Versi dengan tambahan data Directivity) ---
 @beam_blueprint.route("/get-beams-with-contours", methods=["GET"])
 @jwt_required()
 def get_beams_with_contours():
@@ -135,27 +135,36 @@ def get_beams_with_contours():
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
 
-            # Query awal diubah untuk JOIN dan FILTER berdasarkan id_akun
+            # --- PERUBAHAN DI SINI ---
+            # Query SQL diperbarui untuk mengambil 'a.directivity' dari tabel antena
             sql_beams = """
-                SELECT b.id, b.clat AS center_lat, b.clon AS center_lon, b.id_antena
+                SELECT 
+                    b.id, 
+                    b.clat AS center_lat, 
+                    b.clon AS center_lon, 
+                    b.id_antena,
+                    a.directivity AS antenna_directivity_dBi  -- Mengambil directivity dan memberi nama alias
                 FROM beam AS b
                 JOIN antena AS a ON b.id_antena = a.id
                 JOIN satelite AS s ON a.id_satelite = s.id
                 WHERE s.id_akun = %s
                 ORDER BY b.id
             """
+            # --- AKHIR PERUBAHAN ---
+
             cur.execute(sql_beams, (id_akun_login,))
             beams = cur.fetchall()
 
             if not beams:
                 return jsonify([])
 
+            # Proses selanjutnya tidak perlu diubah, karena data directivity sudah ada di dalam 'beams'
             beam_map = {beam['id']: beam for beam in beams}
             for beam in beam_map.values():
                 beam['contours'] = []
 
             beam_ids = tuple(beam_map.keys())
-            if not beam_ids: # Jika tidak ada beam, kembalikan list kosong
+            if not beam_ids:
                 return jsonify([])
 
             placeholders = ", ".join(["%s"] * len(beam_ids))
@@ -182,7 +191,6 @@ def get_beams_with_contours():
             return jsonify(list(beam_map.values()))
     except Error as err:
         return jsonify({"error": f"Database error: {err}"}), 500
-
 
 # --- Endpoint POST (Membuat & Menyimpan Beam, Versi Aman) ---
 @beam_blueprint.route("/store-beam", methods=["POST"])
